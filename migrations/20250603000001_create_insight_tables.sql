@@ -1,0 +1,1 @@
+-- Insight service uses live queries to Entry; no tables needed for MVP.
