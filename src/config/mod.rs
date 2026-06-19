@@ -1,0 +1,1 @@
+// Config module — reads environment variables for the insight service.
