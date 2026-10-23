@@ -71,6 +71,7 @@ impl BudgetClient {
     pub async fn list_budgets(&mut self, org_id: &str, user_id: &str) -> Result<crate::pb::service::budget::ListBudgetsResponse, tonic::Status> {
         let mut req = tonic::Request::new(ListBudgetsRequest {
             org_id: org_id.to_string(),
+            params: None,
         });
         req.metadata_mut().insert(
             "x-user-id",

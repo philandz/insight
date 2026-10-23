@@ -11,6 +11,47 @@ use std::sync::Arc;
 use tonic::Status;
 use tokio::sync::Mutex;
 
+/// Sums of one set of entries. Transfers are tracked separately and never touch
+/// income/expense/net (plan I3).
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
+pub struct Totals {
+    pub income: i64,
+    pub expense: i64,
+    pub transfer_in: i64,
+    pub transfer_out: i64,
+    pub saved_to_funds: i64,
+}
+
+impl Totals {
+    pub fn net(&self) -> i64 {
+        self.income.saturating_sub(self.expense)
+    }
+    pub fn cash_flow(&self) -> i64 {
+        self.net()
+            .saturating_add(self.transfer_in)
+            .saturating_sub(self.transfer_out)
+    }
+}
+
+pub fn tally(entries: &[crate::pb::service::entry::Entry]) -> Totals {
+    let mut t = Totals::default();
+    for e in entries {
+        match EntryKind::try_from(e.kind).unwrap_or(EntryKind::Unspecified) {
+            EntryKind::Income => t.income += e.amount,
+            EntryKind::Expense => t.expense += e.amount,
+            EntryKind::TransferIn => t.transfer_in += e.amount,
+            EntryKind::TransferOut => {
+                t.transfer_out += e.amount;
+                if e.counterparty_kind.as_deref() == Some("fund_cash") {
+                    t.saved_to_funds += e.amount;
+                }
+            }
+            _ => {}
+        }
+    }
+    t
+}
+
 pub struct InsightBiz {
     pub repo: Arc<InsightRepository>,
     pub entry_client: Arc<Mutex<EntryClient>>,
@@ -34,13 +75,13 @@ impl InsightBiz {
         Status::internal(e.to_string())
     }
 
-    async fn compute_monthly_net(
+    async fn compute_monthly_totals(
         &self,
         user_id: &str,
         budget_id: &str,
         year: i32,
         month: u32,
-    ) -> Result<(i64, i64, i64, f64), Status> {
+    ) -> Result<Totals, Status> {
         let date_from = format!("{}-{:02}-01", year, month);
         let last_day = last_day_of_month(year, month);
         let date_to = format!("{}-{:02}-{}", year, month, last_day);
@@ -51,19 +92,7 @@ impl InsightBiz {
             .await
             .map_err(Self::map_err)?;
 
-        let mut income = 0i64;
-        let mut expense = 0i64;
-        for entry in resp.entries.iter() {
-            let kind = EntryKind::try_from(entry.kind).unwrap_or(EntryKind::Unspecified);
-            match kind {
-                EntryKind::Income => income += entry.amount,
-                EntryKind::Expense => expense += entry.amount,
-                _ => {}
-            }
-        }
-        let net = income.saturating_sub(expense);
-        let savings_rate = if income > 0 { net as f64 / income as f64 } else { 0.0 };
-        Ok((income, expense, net, savings_rate))
+        Ok(tally(&resp.entries))
     }
 
     pub async fn get_monthly_summary(
@@ -71,18 +100,21 @@ impl InsightBiz {
         user_id: &str,
         req: MonthlySummaryRequest,
     ) -> Result<MonthlySummaryResponse, Status> {
-        let (income, expense, net, savings_rate) =
-            self.compute_monthly_net(user_id, &req.budget_id, req.year, req.month as u32)
-                .await?;
+        let cur = self
+            .compute_monthly_totals(user_id, &req.budget_id, req.year, req.month as u32)
+            .await?;
+        let (income, expense, net) = (cur.income, cur.expense, cur.net());
+        let savings_rate = if income > 0 { net as f64 / income as f64 } else { 0.0 };
 
         let (prior_year, prior_month) = if req.month == 1 {
             (req.year - 1, 12)
         } else {
             (req.year, req.month - 1)
         };
-        let (_, _, prior_net, _) = self
-            .compute_monthly_net(user_id, &req.budget_id, prior_year, prior_month as u32)
-            .await?;
+        let prior_net = self
+            .compute_monthly_totals(user_id, &req.budget_id, prior_year, prior_month as u32)
+            .await?
+            .net();
 
         let delta = net.saturating_sub(prior_net);
 
@@ -93,10 +125,14 @@ impl InsightBiz {
             savings_rate,
             delta_vs_last_month: delta,
             prior_net,
+            transfer_in: cur.transfer_in,
+            transfer_out: cur.transfer_out,
+            cash_flow: cur.cash_flow(),
+            saved_to_funds: cur.saved_to_funds,
         })
     }
 
-    async fn compute_weekly_net(&self, user_id: &str, budget_id: &str, week_start: &str) -> Result<(i64, i64, i64), Status> {
+    async fn compute_weekly_totals(&self, user_id: &str, budget_id: &str, week_start: &str) -> Result<Totals, Status> {
         let date_from = week_start.to_string();
         let base = chrono::NaiveDate::parse_from_str(week_start, "%Y-%m-%d")
             .map_err(|e| Self::map_err(e.to_string()))?;
@@ -108,18 +144,7 @@ impl InsightBiz {
             .await
             .map_err(Self::map_err)?;
 
-        let mut income = 0i64;
-        let mut expense = 0i64;
-        for entry in resp.entries.iter() {
-            let kind = EntryKind::try_from(entry.kind).unwrap_or(EntryKind::Unspecified);
-            match kind {
-                EntryKind::Income => income += entry.amount,
-                EntryKind::Expense => expense += entry.amount,
-                _ => {}
-            }
-        }
-        let net = income.saturating_sub(expense);
-        Ok((income, expense, net))
+        Ok(tally(&resp.entries))
     }
 
     pub async fn get_weekly_summary(
@@ -127,8 +152,15 @@ impl InsightBiz {
         user_id: &str,
         req: WeeklySummaryRequest,
     ) -> Result<WeeklySummaryResponse, Status> {
-        let (income, expense, net) = self.compute_weekly_net(user_id, &req.budget_id, &req.week_start).await?;
-        Ok(WeeklySummaryResponse { income, expense, net })
+        let t = self.compute_weekly_totals(user_id, &req.budget_id, &req.week_start).await?;
+        Ok(WeeklySummaryResponse {
+            income: t.income,
+            expense: t.expense,
+            net: t.net(),
+            transfer_in: t.transfer_in,
+            transfer_out: t.transfer_out,
+            cash_flow: t.cash_flow(),
+        })
     }
 
     pub async fn get_net_worth(
