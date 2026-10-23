@@ -1,5 +1,6 @@
 use crate::pb::service::insight::insight_service_server::InsightService;
 use crate::pb::service::insight::{
+    PeriodSummary, PeriodSummaryRequest,
     CategoryDrilldownRequest, CategoryDrilldownResponse, MonthlySummaryRequest,
     MonthlySummaryResponse, NetWorthRequest, NetWorthResponse, WeeklySummaryRequest,
     WeeklySummaryResponse, YearlySummaryRequest, YearlySummaryResponse,
@@ -67,6 +68,16 @@ impl InsightService for InsightHandler {
         let user_id = crate::manager::validate::user_id_from_metadata(request.metadata())?;
         let req = request.into_inner();
         let resp = self.biz.get_yearly_summary(&user_id, req).await?;
+        Ok(Response::new(resp))
+    }
+
+    async fn get_period_summary(
+        &self,
+        request: Request<PeriodSummaryRequest>,
+    ) -> Result<Response<PeriodSummary>, Status> {
+        let user_id = crate::manager::validate::user_id_from_metadata(request.metadata())?;
+        let req = request.into_inner();
+        let resp = self.biz.get_period_summary(&user_id, req).await?;
         Ok(Response::new(resp))
     }
 }

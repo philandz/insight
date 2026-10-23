@@ -1,11 +1,13 @@
+use crate::manager::period_summary::{compute, Rollover};
 use crate::pb::service::insight::{
+    PeriodSummary, PeriodSummaryRequest,
     BudgetNetWorth, CategoryDrilldownResponse, CategoryTotal, DrilledEntry,
     CategoryDrilldownRequest, MonthlySummaryRequest, MonthlySummaryResponse,
     NetWorthRequest, NetWorthResponse, WeeklySummaryRequest, WeeklySummaryResponse,
     YearlySummaryRequest, YearlySummaryResponse,
 };
 use crate::pb::service::entry::EntryKind;
-use crate::manager::client::{BudgetClient, EntryClient};
+use crate::manager::client::{BudgetClient, CategoryClient, EntryClient};
 use crate::manager::repository::InsightRepository;
 use std::sync::Arc;
 use tonic::Status;
@@ -56,6 +58,7 @@ pub struct InsightBiz {
     pub repo: Arc<InsightRepository>,
     pub entry_client: Arc<Mutex<EntryClient>>,
     pub budget_client: Arc<Mutex<BudgetClient>>,
+    pub category_client: Option<Arc<Mutex<CategoryClient>>>,
 }
 
 impl InsightBiz {
@@ -68,7 +71,76 @@ impl InsightBiz {
             repo,
             entry_client: Arc::new(Mutex::new(entry_client)),
             budget_client: Arc::new(Mutex::new(budget_client)),
+            category_client: None,
         }
+    }
+
+    /// Enables `get_period_summary` (needs the category service for plans).
+    pub fn with_category_client(mut self, client: CategoryClient) -> Self {
+        self.category_client = Some(Arc::new(Mutex::new(client)));
+        self
+    }
+
+    /// Plan vs actual for the budget period `req.offset` away from the current one.
+    /// Looks back at most 12 periods for rollover; older leftovers are ignored.
+    pub async fn get_period_summary(
+        &self,
+        user_id: &str,
+        req: PeriodSummaryRequest,
+    ) -> Result<PeriodSummary, Status> {
+        use chrono::TimeZone;
+        const LOOKBACK: i32 = 12;
+        let category = self
+            .category_client
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("category service is not configured"))?;
+        let offset = req.offset.clamp(-120, 120);
+
+        let (role, start_day, tz_name) = self
+            .budget_client
+            .lock()
+            .await
+            .check_role_ctx(user_id, &req.budget_id)
+            .await?;
+        if role == crate::pb::service::budget::BudgetRole::Unspecified {
+            return Err(Status::permission_denied("Not a member of this budget"));
+        }
+        let policy = match self
+            .budget_client
+            .lock()
+            .await
+            .get_rollover_policy(user_id, &req.budget_id)
+            .await?
+        {
+            crate::pb::service::budget::RolloverPolicy::CarryForward => Rollover::CarryForward,
+            _ => Rollover::Reset,
+        };
+
+        let tz: chrono_tz::Tz = tz_name.parse().unwrap_or(chrono_tz::Asia::Ho_Chi_Minh);
+        let today = tz.from_utc_datetime(&chrono::Utc::now().naive_utc()).date_naive();
+        let from_offset = offset - LOOKBACK;
+        let plans = category
+            .lock()
+            .await
+            .plan_range(user_id, &req.budget_id, from_offset, offset)
+            .await?;
+        let periods: Vec<(chrono::NaiveDate, chrono::NaiveDate)> = (from_offset..=offset)
+            .map(|o| philand_time::period::shift_period(today, start_day, o))
+            .collect();
+        if plans.len() != periods.len() {
+            return Err(Status::internal("plan range does not match requested periods"));
+        }
+        let rows = self
+            .entry_client
+            .lock()
+            .await
+            .period_totals_daily(
+                &req.budget_id,
+                &philand_time::period::ymd(periods[0].0),
+                &philand_time::period::ymd(periods[periods.len() - 1].1),
+            )
+            .await?;
+        Ok(compute(&req.budget_id, &periods, &plans, &rows, policy, today))
     }
 
     fn map_err(e: impl ToString) -> Status {

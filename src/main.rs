@@ -1,7 +1,7 @@
 use insight::pb::service::insight::insight_service_server::InsightServiceServer;
 use insight::handler::InsightHandler;
 use insight::manager::biz::InsightBiz;
-use insight::manager::client::{BudgetClient, EntryClient};
+use insight::manager::client::{BudgetClient, CategoryClient, EntryClient};
 use insight::manager::repository::InsightRepository;
 use axum::{routing::get, Json, Router};
 use std::{net::SocketAddr, sync::Arc};
@@ -45,7 +45,13 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to init repository: {e}"))?;
     tracing::info!("Storage initialized");
 
-    let biz = Arc::new(InsightBiz::new(Arc::new(repo), entry_client, budget_client));
+    let category_url = std::env::var("CATEGORY_GRPC_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:50104".to_string());
+    let category_client = CategoryClient::connect_lazy(&category_url)?;
+    let biz = Arc::new(
+        InsightBiz::new(Arc::new(repo), entry_client, budget_client)
+            .with_category_client(category_client),
+    );
     let grpc_handler = InsightHandler::new(biz);
 
     let grpc_addr: SocketAddr = format!("{grpc_host}:{grpc_port}").parse()?;
